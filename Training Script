@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+Training script - reproduces training from scratch.
+
+THREE MODES (no manual edits needed in any mode):
+ 1. Paired dataset:      --clean_dir data/train/clean --degraded_dir data/train/degraded
+ 2. Clean-only dataset:  --clean_dir data/train/clean   (degradation synthesized on the fly)
+ 3. Smoke test (no data):--synthetic                    (generates wafer-like phantoms)
+"""
+import argparse
+import json
+import math
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+from model import UNet
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+# ----------------------------- utilities ---------------------------------
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(torch.cuda.current_device() if torch.cuda.is_available() else 0)
+    torch.manual_seed(seed)
+
+
+def pil_to_tensor(path, in_channels, size):
+    img = Image.open(path).convert("L" if in_channels == 1 else "RGB")
+    img = img.resize((size, size), Image.BILINEAR)
+    return TF.to_tensor(img)
+
+
+def psnr(a, b):
+    mse = torch.mean((a - b) ** 2).item()
+    return 60.0 if mse <= 1e-12 else 10 * math.log10(1.0 / mse)
+
+
+# ------------------- synthetic degradation pipeline ----------------------
+def degrade_image(clean, rng):
+    t = clean.clone()
+    if rng.random() < 0.9:                                   # blur
+        sigma = rng.uniform(0.5, 2.0)
+        t = TF.gaussian_blur(t, kernel_size=2 * int(sigma * 2) + 1, sigma=sigma)
+    t = t + torch.randn_like(t) * rng.uniform(0.01, 0.08)    # noise
+    t = t * rng.uniform(0.8, 1.0) + rng.uniform(-0.05, 0.05) # intensity shift
+    if rng.random() < 0.5:                                   # resolution loss
+        h, w = t.shape[-2:]
+        s = rng.choice([2, 4])
+        t = TF.resize(t, size=(h // s, w // s), antialias=True)
+        t = TF.resize(t, size=(h, w), antialias=True)
+    return t.clamp(0.0, 1.0)
+
+
+# --------------------- synthetic wafer-like phantoms ---------------------
+def make_synthetic_clean(size, rng):
+    img = np.zeros((size, size), dtype=np.float32)
+    img += rng.uniform(0.05, 0.2)
+    mode = rng.randint(0, 2)
+    if mode == 0:  # interconnect lines
+        for _ in range(rng.randint(4, 10)):
+            w = rng.randint(4, 14)
+            if rng.random() < 0.5:
+                y = rng.randint(0, size - w)
+                img[y:y + w, :] += rng.uniform(0.5, 0.8)
+            else:
+                x = rng.randint(0, size - w)
+                img[:, x:x + w] += rng.uniform(0.5, 0.8)
+    elif mode == 1:  # contact holes
+        for _ in range(rng.randint(10, 30)):
+            r = rng.randint(3, 10)
+            y, x = rng.randint(r, size - r), rng.randint(r, size - r)
+            y0, y1, x0, x1 = y - r, y + r + 1, x - r, x + r + 1
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            img[y0:y1, x0:x1][(yy - y) ** 2 + (xx - x) ** 2 <= r * r] += rng.uniform(0.5, 0.8)
+    else:  # pads / rectangles
+        for _ in range(rng.randint(3, 8)):
+            h, w = rng.randint(8, 40), rng.randint(8, 40)
+            y, x = rng.randint(0, size - h), rng.randint(0, size - w)
+            img[y:y + h, x:x + w] += rng.uniform(0.4, 0.8)
+    img += rng.random((size, size)).astype(np.float32) * 0.03
+    return torch.from_numpy(np.clip(img, 0.0, 1.0)).float().unsqueeze(0)
+
+
+# ------------------------------- dataset ---------------------------------
+class RestorationDataset(Dataset):
+    def __init__(self, samples, img_size, in_channels, seed):
+        self.samples = samples
+        self.img_size = img_size
+        self.in_channels = in_channels
+        self.rng = random.Random(seed)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        s = self.samples[i]
+        clean = (make_synthetic_clean(self.img_size, self.rng) if s["clean"] is None
+                 else pil_to_tensor(s["clean"], self.in_channels, self.img_size))
+        degraded = (pil_to_tensor(s["degraded"], self.in_channels, self.img_size)
+                    if s["degraded"] is not None
+                    else degrade_image(clean, self.rng))
+        return degraded, clean
+
+
+# ------------------------------ SSIM loss ---------------------------------
+class SSIMLoss(nn.Module):
+    def __init__(self, channels=1, window_size=11):
+        super().__init__()
+        self.channels, self.ws = channels, window_size
+        x = torch.arange(window_size).float() - window_size // 2
+        g = torch.exp(-(x ** 2) / (2 * 1.5 ** 2))
+        g = g / g.sum()
+        w = g.unsqueeze(1) @ g.unsqueeze(0)
+        self.register_buffer("window",
+                             w.view(1, 1, window_size, window_size)
+                             .expand(channels, 1, window_size, window_size).contiguous())
+
+    def forward(self, x, y):
+        p = self.ws // 2
+        mu_x = F.conv2d(x, self.window, padding=p, groups=self.channels)
+        mu_y = F.conv2d(y, self.window, padding=p, groups=self.channels)
+        sx = F.conv2d(x * x, self.window, padding=p, groups=self.channels) - mu_x * mu_x
+        sy = F.conv2d(y * y, self.window, padding=p, groups=self.channels) - mu_y * mu_y
+        sxy = F.conv2d(x * y, self.window, padding=p, groups=self.channels) - mu_x * mu_y
+        c1, c2 = 0.01 ** 2, 0.03 ** 2
+        ssim = ((2 * mu_x * mu_y + c1) * (2 * sxy + c2)) / \
+               ((mu_x ** 2 + mu_y ** 2 + c1) * (sx + sy + c2))
+        return 1 - ssim.mean()
+
+
+# -------------------------------- main ------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Train restoration model from scratch.")
+    p.add_argument("--clean_dir", default=None)
+    p.add_argument("--degraded_dir", default=None)
+    p.add_argument("--synthetic", action="store_true",
+                   help="Train on synthetic wafer phantoms (smoke test, no data needed).")
+    p.add_argument("--synthetic_samples", type=int, default=400)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--img_size", type=int, default=256)
+    p.add_argument("--in_channels", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--val_split", type=float, default=0.1)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--save_dir", default="weights")
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    return p.parse_args()
+
+
+def build_samples(args):
+    if args.synthetic:
+        return [{"clean": None, "degraded": None}] * args.synthetic_samples
+    if not args.clean_dir:
+        raise SystemExit("[ERROR] Provide --clean_dir (+ optional --degraded_dir) "
+                         "or use --synthetic for a smoke test.")
+    clean_files = sorted(p for p in Path(args.clean_dir).iterdir()
+                         if p.suffix.lower() in IMAGE_EXTS)
+    if not clean_files:
+        raise SystemExit(f"[ERROR] No images found in {args.clean_dir}")
+    if args.degraded_dir:
+        dmap = {p.stem: p for p in Path(args.degraded_dir).iterdir()
+                if p.suffix.lower() in IMAGE_EXTS}
+        samples = [{"clean": c, "degraded": dmap[c.stem]}
+                   for c in clean_files if c.stem in dmap]
+        if not samples:
+            raise SystemExit("[ERROR] No matching degraded/clean filename pairs.")
+    else:
+        samples = [{"clean": c, "degraded": None} for c in clean_files]
+    return samples
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available())
+                          else ("cuda" if args.device == "cuda" else "cpu"))
+    print(f"[INFO] device={device}")
+
+    samples = build_samples(args)
+    rng = random.Random(args.seed)
+    rng.shuffle(samples)
+    n_val = max(1, int(len(samples) * args.val_split))
+    val_samples, train_samples = samples[:n_val], samples[n_val:]
+
+    train_ds = RestorationDataset(train_samples, args.img_size, args.in_channels, args.seed)
+    val_ds = RestorationDataset(val_samples, args.img_size, args.in_channels, args.seed + 1)
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                          num_workers=args.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
+
+    config = {"in_channels": args.in_channels, "out_channels": args.in_channels,
+              "base_channels": 32, "depth": 3}
+    model = UNet(**config).to(device)
+    l1, ssim_loss = nn.L1Loss(), SSIMLoss(args.in_channels).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    best_psnr = -1.0
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        running = 0.0
+        for deg, cln in tqdm(train_dl, desc=f"Epoch {epoch}/{args.epochs}"):
+            deg, cln = deg.to(device), cln.to(device)
+            opt.zero_grad()
+            pred = model(deg)
+            loss = l1(pred, cln) + 0.5 * ssim_loss(pred, cln)
+            loss.backward()
+            opt.step()
+            running += loss.item()
+        sched.step()
+
+        model.eval()
+        scores = []
+        with torch.inference_mode():
+            for deg, cln in val_dl:
+                pred = model(deg.to(device)).clamp(0, 1)
+                scores.append(psnr(pred.cpu(), cln))
+        val_psnr = float(np.mean(scores))
+        print(f"[Epoch {epoch}] train_loss={running / max(len(train_dl), 1):.4f} "
+              f"val_psnr={val_psnr:.2f} dB")
+
+        if val_psnr > best_psnr:
+            best_psnr = val_psnr
+            torch.save({"state_dict": model.state_dict(), "config": config,
+                        "metrics": {"val_psnr_db": best_psnr, "epoch": epoch}},
+                       save_dir / "model_best.pt")
+            print(f"[SAVE] New best model ({best_psnr:.2f} dB)")
+
+    torch.save({"state_dict": model.state_dict(), "config": config,
+                "metrics": {"val_psnr_db": best_psnr}}, save_dir / "model_last.pt")
+    (save_dir / "metrics.json").write_text(
+        json.dumps({"best_val_psnr_db": best_psnr, "epochs": args.epochs}, indent=2))
+    print("\n[NEXT STEPS]\n"
+          " 1. python evaluate.py --input_dir <test_dir> --output_dir restored_test_outputs\n"
+          " 2. Commit weights/ and restored_test_outputs/ (see README for Git LFS steps).")
+
+
+if __name__ == "__main__":
+    main()
