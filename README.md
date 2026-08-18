@@ -1,5 +1,5 @@
 # KLA-Problem-Statement-Semicon-26
-Repository created by Sahana.S,Shri Bargavi.Sivaani S,Shri Vatsan from SSNCE for KLA problem statement in Semicon 2026
+Repository created by Sahana.S,Shri Bargavi,Sivaani S,Shri Vatsan from SSNCE for KLA problem statement in Semicon 2026
 KLA Image Restoration — Evaluation Package
 This repository contains the evaluation component for the KLA image-restoration challenge.
 The model is expected to restore a degraded single-channel grayscale image that may contain:
